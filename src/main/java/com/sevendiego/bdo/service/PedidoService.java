@@ -7,13 +7,20 @@ import java.time.ZoneOffset;
 import java.util.List;
 import java.util.Optional;
 
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.server.ResponseStatusException;
 
+import com.sevendiego.bdo.client.ProveedorLogisticoClient;
 import com.sevendiego.bdo.dto.ClienteRequest;
 import com.sevendiego.bdo.dto.LineaPedidoRequest;
 import com.sevendiego.bdo.dto.PedidoRequest;
+import com.sevendiego.bdo.dto.TarifaRequest;
+import com.sevendiego.bdo.dto.TarifaResponse;
 import com.sevendiego.bdo.model.Cliente;
+import com.sevendiego.bdo.model.EstadoPedido;
 import com.sevendiego.bdo.model.LineaPedido;
 import com.sevendiego.bdo.model.Pedido;
 import com.sevendiego.bdo.repository.ClienteRepository;
@@ -24,11 +31,14 @@ public class PedidoService {
 
     private final PedidoRepository pedidoRepository;
     private final ClienteRepository clienteRepository;
+    private final ProveedorLogisticoClient proveedorLogisticoClient;
 
     public PedidoService(PedidoRepository pedidoRepository,
-                         ClienteRepository clienteRepository) {
+                         ClienteRepository clienteRepository,
+                         ProveedorLogisticoClient proveedorLogisticoClient) {
         this.pedidoRepository = pedidoRepository;
         this.clienteRepository = clienteRepository;
+        this.proveedorLogisticoClient = proveedorLogisticoClient;
     }
 
     @Transactional
@@ -97,4 +107,74 @@ public class PedidoService {
         pedido.setCosteEnvio(BigDecimal.ZERO);
         pedido.setImporteTotal(importeProductos);
     }
+    
+    public void confirmarPedido(Long id) {
+
+        // Reservar el pedido para esta confirmación
+        int actualizados = pedidoRepository.actualizarEstadoSiCoincide(
+                id,
+                EstadoPedido.PENDIENTE,
+                EstadoPedido.CALCULANDO_ENVIO
+        );
+
+        if (actualizados == 0) {
+            if (!pedidoRepository.existsById(id)) {
+                throw new ResponseStatusException(
+                        HttpStatus.NOT_FOUND, "Pedido no encontrado.");
+            }
+
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT, "El pedido no está pendiente.");
+        }
+
+        // Recuperar pedido
+        Pedido pedido = pedidoRepository.findById(id).orElseThrow();
+
+        // Consultar proveedor logístico
+        TarifaResponse tarifa;
+
+        try {
+            TarifaRequest request = new TarifaRequest(
+                    pedido.getCodigoPostalDestino(),
+                    pedido.getPesoKg(),
+                    pedido.getNumeroBultos()
+            );
+
+            tarifa = proveedorLogisticoClient.calcularTarifa(request);
+            validarTarifa(tarifa);
+
+        } catch (RestClientException | IllegalStateException e) {
+
+            pedidoRepository.actualizarEstadoSiCoincide(
+                    id,
+                    EstadoPedido.CALCULANDO_ENVIO,
+                    EstadoPedido.ERROR_ENVIO
+            );
+
+            throw new ResponseStatusException(
+                    HttpStatus.BAD_GATEWAY,
+                    "Error al consultar el proveedor logístico.", e);
+        }
+
+        // Actualizar importe y confirmar pedido
+        pedido.setCosteEnvio(tarifa.coste());
+        pedido.setImporteTotal(
+                pedido.getImporteProductos().add(tarifa.coste())
+        );
+        pedido.setEstado(EstadoPedido.CONFIRMADO);
+
+        pedidoRepository.save(pedido);
+    }
+
+	private void validarTarifa(TarifaResponse tarifa) {
+	    if (tarifa == null
+	            || tarifa.coste() == null
+	            || tarifa.coste().signum() < 0
+	            || tarifa.coste().scale() > 2
+	            || !"EUR".equals(tarifa.moneda())) {
+
+	        throw new IllegalStateException(
+	                "Tarifa del proveedor no válida.");
+	    }		
+	}
 }
